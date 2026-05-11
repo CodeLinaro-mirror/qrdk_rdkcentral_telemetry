@@ -20,6 +20,8 @@
 #include <string.h>
 #include <stdlib.h>
 #include <sys/time.h>
+#include <sys/select.h>
+#include <sys/inotify.h>
 #include <net/if.h>
 #include <ifaddrs.h>
 #include <stdbool.h>
@@ -61,6 +63,25 @@
 #define RFC_RETRY_TIMEOUT 60
 #define XCONF_RETRY_TIMEOUT 180
 #define MAX_XCONF_RETRY_COUNT 5
+/*
+ * NTP Sync Gating for Xconf Fetch 
+ *
+ * /tmp/clock-event is a platform-provided one-time NTP sync indicator,
+ * unified across all platforms. It is created once after NTP synchronizes
+ * and is NOT removed on network disconnection.
+ *
+ * Design decisions (confirmed with NTP team):
+ * - adjtimex() is redundant since /tmp/clock-event serves the same purpose
+ * - No dedicated monitor thread — reuses existing xconf worker thread
+ * - One-shot gate at boot only; not used for proactive xconf reload on
+ *   network reconnect (file is never removed, so re-triggering is not possible)
+ * - Uses inotify for instant zero-CPU detection, with select() for
+ *   interruptible shutdown
+ */
+#define NTP_SYNC_INDICATOR "/tmp/clock-event"
+#define NTP_SYNC_DIR "/tmp"
+#define NTP_SYNC_FILENAME "clock-event"
+#define NTP_SYNC_TIMEOUT_SEC 1200
 #define XCONF_CONFIG_FILE  "DCMresponse.txt"
 #define PROCESS_CONFIG_COMPLETE_FLAG "/tmp/t2DcmComplete"
 #define HTTP_RESPONSE_FILE "/tmp/httpOutput.txt"
@@ -845,6 +866,121 @@ T2ERROR getRemoteConfigURL(char **configURL)
     return ret;
 }
 
+/**
+ * @brief Wait for NTP time synchronization before proceeding with xconf fetch.
+ *
+ * Blocks until /tmp/clock-event exists, indicating NTP has synced and
+ * network + accurate system time are available (required for TLS).
+ *
+ * Detection: inotify watch on /tmp for file creation (zero CPU while waiting).
+ * Interruptibility: select() with 2s timeout checks stopFetchRemoteConfiguration.
+ * Fallback: If inotify setup fails, sleeps 60s then rechecks.
+ *
+ * Called once at boot, outside the do-while restart loop — startXConfClient()
+ * restarts skip this (NTP already synced by then).
+ *
+ * @return true if NTP sync detected, false on timeout/shutdown/error
+ */
+static bool waitForNTPSync(void)
+{
+    T2Info("Waiting for NTP sync indicator: %s\n", NTP_SYNC_INDICATOR);
+
+    /* Fast path: file already exists (e.g. daemon restart after NTP synced) */
+    if (access(NTP_SYNC_INDICATOR, F_OK) == 0)
+    {
+        T2Info("NTP sync already detected, proceeding with xconf fetch\n");
+        return true;
+    }
+
+    int ifd = inotify_init1(IN_CLOEXEC);
+    if (ifd < 0)
+    {
+        T2Error("inotify_init1 failed (errno=%d), falling back to timed wait\n", errno);
+        sleep(60);
+        return (access(NTP_SYNC_INDICATOR, F_OK) == 0);
+    }
+
+    int wd = inotify_add_watch(ifd, NTP_SYNC_DIR, IN_CREATE | IN_MOVED_TO);
+    if (wd < 0)
+    {
+        T2Error("inotify_add_watch on %s failed (errno=%d)\n", NTP_SYNC_DIR, errno);
+        close(ifd);
+        sleep(60);
+        return (access(NTP_SYNC_INDICATOR, F_OK) == 0);
+    }
+
+    /* Re-check after watch is set to close the race window */
+    if (access(NTP_SYNC_INDICATOR, F_OK) == 0)
+    {
+        T2Info("NTP sync detected (race resolved), proceeding with xconf fetch\n");
+        inotify_rm_watch(ifd, wd);
+        close(ifd);
+        return true;
+    }
+
+    bool result = false;
+    time_t deadline = time(NULL) + NTP_SYNC_TIMEOUT_SEC;
+    char buf[sizeof(struct inotify_event) + NAME_MAX + 1];
+
+    while (!result)
+    {
+        if (stopFetchRemoteConfiguration)
+        {
+            T2Info("NTP wait interrupted by shutdown\n");
+            break;
+        }
+
+        time_t remaining = deadline - time(NULL);
+        if (remaining <= 0)
+        {
+            T2Error("NTP sync wait timed out after %d seconds\n", NTP_SYNC_TIMEOUT_SEC);
+            break;
+        }
+
+        /* Use select() with 2s timeout for interruptibility */
+        struct timeval tv;
+        tv.tv_sec = (remaining > 2) ? 2 : remaining;
+        tv.tv_usec = 0;
+
+        fd_set fds;
+        FD_ZERO(&fds);
+        FD_SET(ifd, &fds);
+
+        int ret = select(ifd + 1, &fds, NULL, NULL, &tv);
+        if (ret < 0)
+        {
+            if (errno == EINTR)
+                continue;
+            T2Error("select() failed (errno=%d)\n", errno);
+            break;
+        }
+        if (ret == 0)
+            continue; /* timeout, loop back to check flags */
+
+        ssize_t len = read(ifd, buf, sizeof(buf));
+        if (len <= 0)
+            continue;
+
+        /* Parse inotify events for our target filename */
+        ssize_t offset = 0;
+        while (offset < len)
+        {
+            struct inotify_event *event = (struct inotify_event *)(buf + offset);
+            if (event->len > 0 && strcmp(event->name, NTP_SYNC_FILENAME) == 0)
+            {
+                T2Info("NTP sync detected (%s created), proceeding with xconf fetch\n", NTP_SYNC_INDICATOR);
+                result = true;
+                break;
+            }
+            offset += sizeof(struct inotify_event) + event->len;
+        }
+    }
+
+    inotify_rm_watch(ifd, wd);
+    close(ifd);
+    return result;
+}
+
 static void* getUpdatedConfigurationThread(void *data)
 {
     (void) data;
@@ -862,6 +998,12 @@ static void* getUpdatedConfigurationThread(void *data)
     pthread_mutex_lock(&xcThreadMutex);
     stopFetchRemoteConfiguration = false ;
     pthread_mutex_unlock(&xcThreadMutex);
+
+    if (!waitForNTPSync())
+    {
+        T2Warning("Proceeding without NTP sync confirmation\n");
+    }
+
     do
     {
         T2Debug("%s while Loop -- START \n", __FUNCTION__);
