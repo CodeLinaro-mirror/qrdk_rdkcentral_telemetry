@@ -64,7 +64,7 @@
 #define XCONF_RETRY_TIMEOUT 180
 #define MAX_XCONF_RETRY_COUNT 5
 /*
- * NTP Sync Gating for Xconf Fetch 
+ * NTP Sync Gating for Xconf Fetch
  *
  * The NTP sync indicator is a platform-provided one-time marker,
  * created once after NTP synchronizes and NOT removed on network disconnection.
@@ -957,16 +957,22 @@ static bool waitForNTPSync(void)
         if (ret < 0)
         {
             if (errno == EINTR)
+            {
                 continue;
+            }
             T2Error("select() failed (errno=%d)\n", errno);
             break;
         }
         if (ret == 0)
-            continue; /* timeout, loop back to check flags */
+        {
+            continue;    /* timeout, loop back to check flags */
+        }
 
         ssize_t len = read(ifd, buf, sizeof(buf));
         if (len <= 0)
+        {
             continue;
+        }
 
         /* Parse inotify events for our target filename */
         ssize_t offset = 0;
