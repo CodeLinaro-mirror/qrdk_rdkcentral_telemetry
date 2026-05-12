@@ -66,21 +66,28 @@
 /*
  * NTP Sync Gating for Xconf Fetch 
  *
- * /tmp/clock-event is a platform-provided one-time NTP sync indicator,
- * unified across all platforms. It is created once after NTP synchronizes
- * and is NOT removed on network disconnection.
+ * The NTP sync indicator is a platform-provided one-time marker,
+ * created once after NTP synchronizes and NOT removed on network disconnection.
+ *   - RDKB:   /tmp/clock-event
+ *   - Others: /tmp/systimemgr/ntp
  *
  * Design decisions (confirmed with NTP team):
- * - adjtimex() is redundant since /tmp/clock-event serves the same purpose
+ * - adjtimex() is redundant since the indicator file serves the same purpose
  * - No dedicated monitor thread — reuses existing xconf worker thread
  * - One-shot gate at boot only; not used for proactive xconf reload on
  *   network reconnect (file is never removed, so re-triggering is not possible)
  * - Uses inotify for instant zero-CPU detection, with select() for
  *   interruptible shutdown
  */
+#if defined(ENABLE_RDKB_SUPPORT)
 #define NTP_SYNC_INDICATOR "/tmp/clock-event"
 #define NTP_SYNC_DIR "/tmp"
 #define NTP_SYNC_FILENAME "clock-event"
+#else
+#define NTP_SYNC_INDICATOR "/tmp/systimemgr/ntp"
+#define NTP_SYNC_DIR "/tmp/systimemgr"
+#define NTP_SYNC_FILENAME "ntp"
+#endif
 #define NTP_SYNC_TIMEOUT_SEC 1200
 #define XCONF_CONFIG_FILE  "DCMresponse.txt"
 #define PROCESS_CONFIG_COMPLETE_FLAG "/tmp/t2DcmComplete"
@@ -869,10 +876,10 @@ T2ERROR getRemoteConfigURL(char **configURL)
 /**
  * @brief Wait for NTP time synchronization before proceeding with xconf fetch.
  *
- * Blocks until /tmp/clock-event exists, indicating NTP has synced and
+ * Blocks until the indicator file exists, indicating NTP has synced and
  * network + accurate system time are available (required for TLS).
  *
- * Detection: inotify watch on /tmp for file creation (zero CPU while waiting).
+ * Detection: inotify watch on the indicator directory for file creation (zero CPU while waiting).
  * Interruptibility: select() with 2s timeout checks stopFetchRemoteConfiguration.
  * Fallback: If inotify setup fails, sleeps 60s then rechecks.
  *
