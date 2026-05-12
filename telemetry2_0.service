@@ -19,7 +19,7 @@
 [Unit]
 Description=To start telemetry2_0
 After=local-fs.target nvram.service previous-log-backup.service network-online.target systemd-timesyncd.service tr69hostif.service rbus.service
-Requires=network-online.target ntp-time-sync.target
+Requires=network-online.target
 
 [Service]
 Type=forking
@@ -29,4 +29,4 @@ ExecStopPost=/bin/rm -rf /tmp/.t2ReadyToReceiveEvents /tmp/telemetry_initialized
 Restart=always
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=ntp-time-sync.target
