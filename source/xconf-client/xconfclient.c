@@ -19,6 +19,9 @@
 
 #include <string.h>
 #include <stdlib.h>
+#include <errno.h>
+#include <limits.h>
+#include <time.h>
 #include <sys/time.h>
 #include <sys/select.h>
 #include <sys/inotify.h>
@@ -931,7 +934,11 @@ static bool waitForNTPSync(void)
 
     while (!result)
     {
-        if (stopFetchRemoteConfiguration)
+        pthread_mutex_lock(&xcThreadMutex);
+        bool shouldStop = stopFetchRemoteConfiguration;
+        pthread_mutex_unlock(&xcThreadMutex);
+
+        if (shouldStop)
         {
             T2Info("NTP wait interrupted by shutdown\n");
             break;
