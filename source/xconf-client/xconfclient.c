@@ -878,6 +878,45 @@ T2ERROR getRemoteConfigURL(char **configURL)
 }
 
 /**
+ * @brief Polling fallback for waitForNTPSync() when inotify is unavailable.
+ *
+ * Used when inotify_init1() or inotify_add_watch() fails (e.g., the watch
+ * directory does not yet exist). Polls NTP_SYNC_INDICATOR every 2s in a loop
+ * that checks stopFetchRemoteConfiguration before each sleep, so shutdown
+ * latency is at most 2s. Waits indefinitely — same guarantee as the inotify
+ * path.
+ *
+ * @return true if indicator file detected, false if shutdown requested.
+ */
+static bool pollForNTPSyncFallback(void)
+{
+    T2Warning("NTP sync fallback: polling %s every 2s (inotify unavailable)\n", NTP_SYNC_INDICATOR);
+
+    for (;;)
+    {
+        pthread_mutex_lock(&xcThreadMutex);
+        bool shouldStop = stopFetchRemoteConfiguration;
+        pthread_mutex_unlock(&xcThreadMutex);
+
+        if (shouldStop)
+        {
+            T2Info("NTP sync wait (fallback) interrupted by shutdown\n");
+            return false;
+        }
+
+        if (access(NTP_SYNC_INDICATOR, F_OK) == 0)
+        {
+            T2Info("NTP sync detected via fallback poll: %s\n", NTP_SYNC_INDICATOR);
+            return true;
+        }
+
+        /* Interruptible 2s sleep — mirrors the select() timeout in the inotify path */
+        struct timeval tv = {2, 0};
+        select(0, NULL, NULL, NULL, &tv);
+    }
+}
+
+/**
  * @brief Wait for NTP time synchronization before proceeding with xconf fetch.
  *
  * Blocks until the indicator file exists, indicating NTP has synced and
@@ -907,18 +946,21 @@ static bool waitForNTPSync(void)
     int ifd = inotify_init1(IN_CLOEXEC);
     if (ifd < 0)
     {
-        T2Error("inotify_init1 failed (errno=%d), falling back to timed wait\n", errno);
-        sleep(60);
-        return (access(NTP_SYNC_INDICATOR, F_OK) == 0);
+        T2Error("inotify_init1 failed (errno=%d), falling back to polling\n", errno);
+        return pollForNTPSyncFallback();
     }
 
     int wd = inotify_add_watch(ifd, NTP_SYNC_DIR, IN_CREATE | IN_MOVED_TO);
     if (wd < 0)
     {
-        T2Error("inotify_add_watch on %s failed (errno=%d)\n", NTP_SYNC_DIR, errno);
+        /*
+         * Most likely cause: NTP_SYNC_DIR does not exist yet (e.g. /tmp/systimemgr
+         * is created by systimemgr at startup). Fall back to polling, which will
+         * detect the indicator file once the directory and file both appear.
+         */
+        T2Error("inotify_add_watch on %s failed (errno=%d), falling back to polling\n", NTP_SYNC_DIR, errno);
         close(ifd);
-        sleep(60);
-        return (access(NTP_SYNC_INDICATOR, F_OK) == 0);
+        return pollForNTPSyncFallback();
     }
 
     /* Re-check after watch is set to close the race window */
