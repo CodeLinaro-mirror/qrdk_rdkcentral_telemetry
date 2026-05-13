@@ -66,6 +66,7 @@
 #define RFC_RETRY_TIMEOUT 60
 #define XCONF_RETRY_TIMEOUT 180
 #define MAX_XCONF_RETRY_COUNT 5
+#if defined(NTP_SYNC_INDICATION)
 /*
  * NTP Sync Gating for Xconf Fetch
  *
@@ -93,6 +94,7 @@
 #define NTP_SYNC_DIR "/tmp/systimemgr"
 #define NTP_SYNC_FILENAME "ntp"
 #endif
+#endif /* NTP_SYNC_INDICATION */
 #define XCONF_CONFIG_FILE  "DCMresponse.txt"
 #define PROCESS_CONFIG_COMPLETE_FLAG "/tmp/t2DcmComplete"
 #define HTTP_RESPONSE_FILE "/tmp/httpOutput.txt"
@@ -877,6 +879,7 @@ T2ERROR getRemoteConfigURL(char **configURL)
     return ret;
 }
 
+#if defined(NTP_SYNC_INDICATION)
 /**
  * @brief Polling fallback for waitForNTPSync() when inotify is unavailable.
  *
@@ -1036,6 +1039,7 @@ static bool waitForNTPSync(void)
     close(ifd);
     return result;
 }
+#endif /* NTP_SYNC_INDICATION */
 
 static void* getUpdatedConfigurationThread(void *data)
 {
@@ -1055,10 +1059,12 @@ static void* getUpdatedConfigurationThread(void *data)
     stopFetchRemoteConfiguration = false ;
     pthread_mutex_unlock(&xcThreadMutex);
 
+#if defined(NTP_SYNC_INDICATION)
     if (!waitForNTPSync())
     {
         T2Warning("Proceeding without NTP sync confirmation\n");
     }
+#endif /* NTP_SYNC_INDICATION */
 
     do
     {
