@@ -81,6 +81,8 @@
  *   network reconnect (file is never removed, so re-triggering is not possible)
  * - Uses inotify for instant zero-CPU detection, with select() for
  *   interruptible shutdown
+ * - Waits indefinitely for NTP sync — without network, xconf fetch is
+ *   pointless. Only exits on shutdown signal or file detection.
  */
 #if defined(ENABLE_RDKB_SUPPORT)
 #define NTP_SYNC_INDICATOR "/tmp/clock-event"
@@ -91,7 +93,6 @@
 #define NTP_SYNC_DIR "/tmp/systimemgr"
 #define NTP_SYNC_FILENAME "ntp"
 #endif
-#define NTP_SYNC_TIMEOUT_SEC 1200
 #define XCONF_CONFIG_FILE  "DCMresponse.txt"
 #define PROCESS_CONFIG_COMPLETE_FLAG "/tmp/t2DcmComplete"
 #define HTTP_RESPONSE_FILE "/tmp/httpOutput.txt"
@@ -885,6 +886,7 @@ T2ERROR getRemoteConfigURL(char **configURL)
  * Detection: inotify watch on the indicator directory for file creation (zero CPU while waiting).
  * Interruptibility: select() with 2s timeout checks stopFetchRemoteConfiguration.
  * Fallback: If inotify setup fails, sleeps 60s then rechecks.
+ * Waits indefinitely — without NTP sync, xconf fetch would fail anyway.
  *
  * Called once at boot, outside the do-while restart loop — startXConfClient()
  * restarts skip this (NTP already synced by then).
@@ -929,7 +931,6 @@ static bool waitForNTPSync(void)
     }
 
     bool result = false;
-    time_t deadline = time(NULL) + NTP_SYNC_TIMEOUT_SEC;
     char buf[sizeof(struct inotify_event) + NAME_MAX + 1];
 
     while (!result)
@@ -944,16 +945,9 @@ static bool waitForNTPSync(void)
             break;
         }
 
-        time_t remaining = deadline - time(NULL);
-        if (remaining <= 0)
-        {
-            T2Error("NTP sync wait timed out after %d seconds\n", NTP_SYNC_TIMEOUT_SEC);
-            break;
-        }
-
         /* Use select() with 2s timeout for interruptibility */
         struct timeval tv;
-        tv.tv_sec = (remaining > 2) ? 2 : remaining;
+        tv.tv_sec = 2;
         tv.tv_usec = 0;
 
         fd_set fds;
