@@ -82,8 +82,12 @@
  *   network reconnect (file is never removed, so re-triggering is not possible)
  * - Uses inotify for instant zero-CPU detection, with select() for
  *   interruptible shutdown
- * - Waits indefinitely for NTP sync — without network, xconf fetch is
- *   pointless. Only exits on shutdown signal or file detection.
+ * - Waits up to NTP_SYNC_WAIT_TIMEOUT_SEC for NTP sync; on timeout proceeds
+ *   anyway, letting the existing xconf retry loop (MAX_XCONF_RETRY_COUNT x
+ *   XCONF_RETRY_TIMEOUT) handle repeated fetch attempts. Total worst-case from
+ *   boot: NTP_SYNC_WAIT_TIMEOUT_SEC + MAX_XCONF_RETRY_COUNT x XCONF_RETRY_TIMEOUT.
+ * - CLOCK_MONOTONIC used for the deadline — CLOCK_REALTIME is not safe before
+ *   NTP has synced.
  */
 #if defined(ENABLE_RDKB_SUPPORT)
 #define NTP_SYNC_INDICATOR "/tmp/clock-event"
@@ -94,6 +98,10 @@
 #define NTP_SYNC_DIR "/tmp/systimemgr"
 #define NTP_SYNC_FILENAME "ntp"
 #endif
+/* Maximum time to wait for NTP sync before proceeding with xconf fetch anyway.
+ * 30 minutes provides headroom beyond typical RDK boot (2-3 min on healthy
+ * network). The xconf retry loop handles fetch failures if NTP is still absent. */
+#define NTP_SYNC_WAIT_TIMEOUT_SEC  1800
 #endif /* NTP_SYNC_INDICATION */
 #define XCONF_CONFIG_FILE  "DCMresponse.txt"
 #define PROCESS_CONFIG_COMPLETE_FLAG "/tmp/t2DcmComplete"
@@ -884,14 +892,14 @@ T2ERROR getRemoteConfigURL(char **configURL)
  * @brief Polling fallback for waitForNTPSync() when inotify is unavailable.
  *
  * Used when inotify_init1() or inotify_add_watch() fails (e.g., the watch
- * directory does not yet exist). Polls NTP_SYNC_INDICATOR every 2s in a loop
- * that checks stopFetchRemoteConfiguration before each sleep, so shutdown
- * latency is at most 2s. Waits indefinitely — same guarantee as the inotify
- * path.
+ * directory does not yet exist). Polls NTP_SYNC_INDICATOR every 2s, checking
+ * stopFetchRemoteConfiguration and the shared monotonic deadline on each
+ * iteration. Shutdown latency is at most 2s.
  *
- * @return true if indicator file detected, false if shutdown requested.
+ * @param deadline  Absolute CLOCK_MONOTONIC time after which to give up.
+ * @return true if indicator file detected, false on timeout or shutdown.
  */
-static bool pollForNTPSyncFallback(void)
+static bool pollForNTPSyncFallback(struct timespec deadline)
 {
     T2Warning("NTP sync fallback: polling %s every 2s (inotify unavailable)\n", NTP_SYNC_INDICATOR);
 
@@ -904,6 +912,14 @@ static bool pollForNTPSyncFallback(void)
         if (shouldStop)
         {
             T2Info("NTP sync wait (fallback) interrupted by shutdown\n");
+            return false;
+        }
+
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        if (now.tv_sec >= deadline.tv_sec)
+        {
+            T2Error("NTP sync wait timed out after %d seconds, proceeding without NTP sync\n", NTP_SYNC_WAIT_TIMEOUT_SEC);
             return false;
         }
 
@@ -926,9 +942,11 @@ static bool pollForNTPSyncFallback(void)
  * network + accurate system time are available (required for TLS).
  *
  * Detection: inotify watch on the indicator directory for file creation (zero CPU while waiting).
- * Interruptibility: select() with 2s timeout checks stopFetchRemoteConfiguration.
- * Fallback: If inotify setup fails, sleeps 60s then rechecks.
- * Waits indefinitely — without NTP sync, xconf fetch would fail anyway.
+ * Interruptibility: select() with 2s timeout checks stopFetchRemoteConfiguration and deadline.
+ * Fallback: If inotify setup fails, delegates to pollForNTPSyncFallback().
+ * Timeout: NTP_SYNC_WAIT_TIMEOUT_SEC (CLOCK_MONOTONIC). On expiry returns false
+ *   and lets the existing xconf retry loop (MAX_XCONF_RETRY_COUNT x XCONF_RETRY_TIMEOUT)
+ *   handle subsequent fetch attempts.
  *
  * Called once at boot, outside the do-while restart loop — startXConfClient()
  * restarts skip this (NTP already synced by then).
@@ -937,7 +955,7 @@ static bool pollForNTPSyncFallback(void)
  */
 static bool waitForNTPSync(void)
 {
-    T2Info("Waiting for NTP sync indicator: %s\n", NTP_SYNC_INDICATOR);
+    T2Info("Waiting for NTP sync indicator: %s (timeout %ds)\n", NTP_SYNC_INDICATOR, NTP_SYNC_WAIT_TIMEOUT_SEC);
 
     /* Fast path: file already exists (e.g. daemon restart after NTP synced) */
     if (access(NTP_SYNC_INDICATOR, F_OK) == 0)
@@ -946,11 +964,16 @@ static bool waitForNTPSync(void)
         return true;
     }
 
+    /* Compute a CLOCK_MONOTONIC deadline — safe to use before NTP sync */
+    struct timespec deadline;
+    clock_gettime(CLOCK_MONOTONIC, &deadline);
+    deadline.tv_sec += NTP_SYNC_WAIT_TIMEOUT_SEC;
+
     int ifd = inotify_init1(IN_CLOEXEC);
     if (ifd < 0)
     {
         T2Error("inotify_init1 failed (errno=%d), falling back to polling\n", errno);
-        return pollForNTPSyncFallback();
+        return pollForNTPSyncFallback(deadline);
     }
 
     int wd = inotify_add_watch(ifd, NTP_SYNC_DIR, IN_CREATE | IN_MOVED_TO);
@@ -963,7 +986,7 @@ static bool waitForNTPSync(void)
          */
         T2Error("inotify_add_watch on %s failed (errno=%d), falling back to polling\n", NTP_SYNC_DIR, errno);
         close(ifd);
-        return pollForNTPSyncFallback();
+        return pollForNTPSyncFallback(deadline);
     }
 
     /* Re-check after watch is set to close the race window */
@@ -990,6 +1013,14 @@ static bool waitForNTPSync(void)
             break;
         }
 
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        if (now.tv_sec >= deadline.tv_sec)
+        {
+            T2Error("NTP sync wait timed out after %d seconds, proceeding without NTP sync\n", NTP_SYNC_WAIT_TIMEOUT_SEC);
+            break;
+        }
+
         /* Use select() with 2s timeout for interruptibility */
         struct timeval tv;
         tv.tv_sec = 2;
@@ -1011,7 +1042,7 @@ static bool waitForNTPSync(void)
         }
         if (ret == 0)
         {
-            continue;    /* timeout, loop back to check flags */
+            continue;    /* timeout, loop back to check flags and deadline */
         }
 
         ssize_t len = read(ifd, buf, sizeof(buf));
