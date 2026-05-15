@@ -916,7 +916,12 @@ static bool pollForNTPSyncFallback(struct timespec deadline)
         }
 
         struct timespec now;
-        clock_gettime(CLOCK_MONOTONIC, &now);
+        if (clock_gettime(CLOCK_MONOTONIC, &now) != 0)
+        {
+            /* Cannot determine elapsed time; treat as timeout to avoid infinite block */
+            T2Error("clock_gettime failed in NTP fallback poll (errno=%d), aborting wait\n", errno);
+            return false;
+        }
         if (now.tv_sec >= deadline.tv_sec)
         {
             T2Error("NTP sync wait timed out after %d seconds, proceeding without NTP sync\n", NTP_SYNC_WAIT_TIMEOUT_SEC);
@@ -966,7 +971,11 @@ static bool waitForNTPSync(void)
 
     /* Compute a CLOCK_MONOTONIC deadline — safe to use before NTP sync */
     struct timespec deadline;
-    clock_gettime(CLOCK_MONOTONIC, &deadline);
+    if (clock_gettime(CLOCK_MONOTONIC, &deadline) != 0)
+    {
+        T2Error("clock_gettime failed (errno=%d), cannot gate on NTP sync\n", errno);
+        return false;
+    }
     deadline.tv_sec += NTP_SYNC_WAIT_TIMEOUT_SEC;
 
     int ifd = inotify_init1(IN_CLOEXEC);
@@ -1014,7 +1023,12 @@ static bool waitForNTPSync(void)
         }
 
         struct timespec now;
-        clock_gettime(CLOCK_MONOTONIC, &now);
+        if (clock_gettime(CLOCK_MONOTONIC, &now) != 0)
+        {
+            /* Cannot determine elapsed time; treat as timeout to avoid infinite block */
+            T2Error("clock_gettime failed in NTP wait loop (errno=%d), aborting wait\n", errno);
+            break;
+        }
         if (now.tv_sec >= deadline.tv_sec)
         {
             T2Error("NTP sync wait timed out after %d seconds, proceeding without NTP sync\n", NTP_SYNC_WAIT_TIMEOUT_SEC);
