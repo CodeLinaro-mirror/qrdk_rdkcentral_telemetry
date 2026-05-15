@@ -19,7 +19,12 @@
 
 #include <string.h>
 #include <stdlib.h>
+#include <errno.h>
+#include <limits.h>
+#include <time.h>
 #include <sys/time.h>
+#include <sys/select.h>
+#include <sys/inotify.h>
 #include <net/if.h>
 #include <ifaddrs.h>
 #include <stdbool.h>
@@ -56,6 +61,43 @@
 #define XCONF_RETRY_TIMEOUT 180
 #define MAX_XCONF_RETRY_COUNT 5
 #define IFINTERFACE      "erouter0"
+#if defined(NTP_SYNC_INDICATION)
+/*
+ * NTP Sync Gating for Xconf Fetch
+ *
+ * The NTP sync indicator is a platform-provided one-time marker,
+ * created once after NTP synchronizes and NOT removed on network disconnection.
+ *   - RDKB:   /tmp/clock-event
+ *   - Others: /tmp/systimemgr/ntp
+ *
+ * Design decisions (confirmed with NTP team):
+ * - adjtimex() is redundant since the indicator file serves the same purpose
+ * - No dedicated monitor thread — reuses existing xconf worker thread
+ * - One-shot gate at boot only; not used for proactive xconf reload on
+ *   network reconnect (file is never removed, so re-triggering is not possible)
+ * - Uses inotify for instant zero-CPU detection, with select() for
+ *   interruptible shutdown
+ * - Waits up to NTP_SYNC_WAIT_TIMEOUT_SEC for NTP sync; on timeout proceeds
+ *   anyway, letting the existing xconf retry loop (MAX_XCONF_RETRY_COUNT x
+ *   XCONF_RETRY_TIMEOUT) handle repeated fetch attempts. Total worst-case from
+ *   boot: NTP_SYNC_WAIT_TIMEOUT_SEC + MAX_XCONF_RETRY_COUNT x XCONF_RETRY_TIMEOUT.
+ * - CLOCK_MONOTONIC used for the deadline — CLOCK_REALTIME is not safe before
+ *   NTP has synced.
+ */
+#if defined(ENABLE_RDKB_SUPPORT)
+#define NTP_SYNC_INDICATOR "/tmp/clock-event"
+#define NTP_SYNC_DIR "/tmp"
+#define NTP_SYNC_FILENAME "clock-event"
+#else
+#define NTP_SYNC_INDICATOR "/tmp/systimemgr/ntp"
+#define NTP_SYNC_DIR "/tmp/systimemgr"
+#define NTP_SYNC_FILENAME "ntp"
+#endif
+/* Maximum time to wait for NTP sync before proceeding with xconf fetch anyway.
+ * 30 minutes provides headroom beyond typical RDK boot (2-3 min on healthy
+ * network). The xconf retry loop handles fetch failures if NTP is still absent. */
+#define NTP_SYNC_WAIT_TIMEOUT_SEC  1800
+#endif /* NTP_SYNC_INDICATION */
 #define XCONF_CONFIG_FILE  "DCMresponse.txt"
 #define PROCESS_CONFIG_COMPLETE_FLAG "/tmp/t2DcmComplete"
 #define HTTP_RESPONSE_FILE "/tmp/httpOutput.txt"
@@ -1280,6 +1322,205 @@ T2ERROR getRemoteConfigURL(char **configURL)
     return ret;
 }
 
+#if defined(NTP_SYNC_INDICATION)
+/**
+ * @brief Polling fallback for waitForNTPSync() when inotify is unavailable.
+ *
+ * Used when inotify_init1() or inotify_add_watch() fails (e.g., the watch
+ * directory does not yet exist). Polls NTP_SYNC_INDICATOR every 2s, checking
+ * stopFetchRemoteConfiguration and the shared monotonic deadline on each
+ * iteration. Shutdown latency is at most 2s.
+ *
+ * @param deadline  Absolute CLOCK_MONOTONIC time after which to give up.
+ * @return true if indicator file detected, false on timeout or shutdown.
+ */
+static bool pollForNTPSyncFallback(struct timespec deadline)
+{
+    T2Warning("NTP sync fallback: polling %s every 2s (inotify unavailable)\n", NTP_SYNC_INDICATOR);
+
+    for (;;)
+    {
+        pthread_mutex_lock(&xcThreadMutex);
+        bool shouldStop = stopFetchRemoteConfiguration;
+        pthread_mutex_unlock(&xcThreadMutex);
+
+        if (shouldStop)
+        {
+            T2Info("NTP sync wait (fallback) interrupted by shutdown\n");
+            return false;
+        }
+
+        struct timespec now;
+        if (clock_gettime(CLOCK_MONOTONIC, &now) != 0)
+        {
+            /* Cannot determine elapsed time; treat as timeout to avoid infinite block */
+            T2Error("clock_gettime failed in NTP fallback poll (errno=%d), aborting wait\n", errno);
+            return false;
+        }
+        if (now.tv_sec >= deadline.tv_sec)
+        {
+            T2Error("NTP sync wait timed out after %d seconds, proceeding without NTP sync\n", NTP_SYNC_WAIT_TIMEOUT_SEC);
+            return false;
+        }
+
+        if (access(NTP_SYNC_INDICATOR, F_OK) == 0)
+        {
+            T2Info("NTP sync detected via fallback poll: %s\n", NTP_SYNC_INDICATOR);
+            return true;
+        }
+
+        /* Interruptible 2s sleep — mirrors the select() timeout in the inotify path */
+        struct timeval tv = {2, 0};
+        select(0, NULL, NULL, NULL, &tv);
+    }
+}
+
+/**
+ * @brief Wait for NTP time synchronization before proceeding with xconf fetch.
+ *
+ * Blocks until the indicator file exists, indicating NTP has synced and
+ * network + accurate system time are available (required for TLS).
+ *
+ * Detection: inotify watch on the indicator directory for file creation (zero CPU while waiting).
+ * Interruptibility: select() with 2s timeout checks stopFetchRemoteConfiguration and deadline.
+ * Fallback: If inotify setup fails, delegates to pollForNTPSyncFallback().
+ * Timeout: NTP_SYNC_WAIT_TIMEOUT_SEC (CLOCK_MONOTONIC). On expiry returns false
+ *   and lets the existing xconf retry loop (MAX_XCONF_RETRY_COUNT x XCONF_RETRY_TIMEOUT)
+ *   handle subsequent fetch attempts.
+ *
+ * Called once at boot, outside the do-while restart loop — startXConfClient()
+ * restarts skip this (NTP already synced by then).
+ *
+ * @return true if NTP sync detected, false on timeout/shutdown/error
+ */
+static bool waitForNTPSync(void)
+{
+    T2Info("Waiting for NTP sync indicator: %s (timeout %ds)\n", NTP_SYNC_INDICATOR, NTP_SYNC_WAIT_TIMEOUT_SEC);
+
+    /* Fast path: file already exists (e.g. daemon restart after NTP synced) */
+    if (access(NTP_SYNC_INDICATOR, F_OK) == 0)
+    {
+        T2Info("NTP sync already detected, proceeding with xconf fetch\n");
+        return true;
+    }
+
+    /* Compute a CLOCK_MONOTONIC deadline — safe to use before NTP sync */
+    struct timespec deadline;
+    if (clock_gettime(CLOCK_MONOTONIC, &deadline) != 0)
+    {
+        T2Error("clock_gettime failed (errno=%d), cannot gate on NTP sync\n", errno);
+        return false;
+    }
+    deadline.tv_sec += NTP_SYNC_WAIT_TIMEOUT_SEC;
+
+    int ifd = inotify_init1(IN_CLOEXEC);
+    if (ifd < 0)
+    {
+        T2Error("inotify_init1 failed (errno=%d), falling back to polling\n", errno);
+        return pollForNTPSyncFallback(deadline);
+    }
+
+    int wd = inotify_add_watch(ifd, NTP_SYNC_DIR, IN_CREATE | IN_MOVED_TO);
+    if (wd < 0)
+    {
+        /*
+         * Most likely cause: NTP_SYNC_DIR does not exist yet (e.g. /tmp/systimemgr
+         * is created by systimemgr at startup). Fall back to polling, which will
+         * detect the indicator file once the directory and file both appear.
+         */
+        T2Error("inotify_add_watch on %s failed (errno=%d), falling back to polling\n", NTP_SYNC_DIR, errno);
+        close(ifd);
+        return pollForNTPSyncFallback(deadline);
+    }
+
+    /* Re-check after watch is set to close the race window */
+    if (access(NTP_SYNC_INDICATOR, F_OK) == 0)
+    {
+        T2Info("NTP sync detected (race resolved), proceeding with xconf fetch\n");
+        inotify_rm_watch(ifd, wd);
+        close(ifd);
+        return true;
+    }
+
+    bool result = false;
+    char buf[sizeof(struct inotify_event) + NAME_MAX + 1];
+
+    while (!result)
+    {
+        pthread_mutex_lock(&xcThreadMutex);
+        bool shouldStop = stopFetchRemoteConfiguration;
+        pthread_mutex_unlock(&xcThreadMutex);
+
+        if (shouldStop)
+        {
+            T2Info("NTP wait interrupted by shutdown\n");
+            break;
+        }
+
+        struct timespec now;
+        if (clock_gettime(CLOCK_MONOTONIC, &now) != 0)
+        {
+            /* Cannot determine elapsed time; treat as timeout to avoid infinite block */
+            T2Error("clock_gettime failed in NTP wait loop (errno=%d), aborting wait\n", errno);
+            break;
+        }
+        if (now.tv_sec >= deadline.tv_sec)
+        {
+            T2Error("NTP sync wait timed out after %d seconds, proceeding without NTP sync\n", NTP_SYNC_WAIT_TIMEOUT_SEC);
+            break;
+        }
+
+        /* Use select() with 2s timeout for interruptibility */
+        struct timeval tv;
+        tv.tv_sec = 2;
+        tv.tv_usec = 0;
+
+        fd_set fds;
+        FD_ZERO(&fds);
+        FD_SET(ifd, &fds);
+
+        int ret = select(ifd + 1, &fds, NULL, NULL, &tv);
+        if (ret < 0)
+        {
+            if (errno == EINTR)
+            {
+                continue;
+            }
+            T2Error("select() failed (errno=%d)\n", errno);
+            break;
+        }
+        if (ret == 0)
+        {
+            continue;    /* timeout, loop back to check flags and deadline */
+        }
+
+        ssize_t len = read(ifd, buf, sizeof(buf));
+        if (len <= 0)
+        {
+            continue;
+        }
+
+        /* Parse inotify events for our target filename */
+        ssize_t offset = 0;
+        while (offset < len)
+        {
+            struct inotify_event *event = (struct inotify_event *)(buf + offset);
+            if (event->len > 0 && strcmp(event->name, NTP_SYNC_FILENAME) == 0)
+            {
+                T2Info("NTP sync detected (%s created), proceeding with xconf fetch\n", NTP_SYNC_INDICATOR);
+                result = true;
+                break;
+            }
+            offset += sizeof(struct inotify_event) + event->len;
+        }
+    }
+
+    inotify_rm_watch(ifd, wd);
+    close(ifd);
+    return result;
+}
+#endif /* NTP_SYNC_INDICATION */
+
 static void* getUpdatedConfigurationThread(void *data)
 {
     (void) data;
@@ -1296,6 +1537,15 @@ static void* getUpdatedConfigurationThread(void *data)
 #endif
     pthread_mutex_lock(&xcThreadMutex);
     stopFetchRemoteConfiguration = false ;
+    pthread_mutex_unlock(&xcThreadMutex);
+
+#if defined(NTP_SYNC_INDICATION)
+    if (!waitForNTPSync())
+    {
+        T2Warning("Proceeding without NTP sync confirmation\n");
+    }
+#endif /* NTP_SYNC_INDICATION */
+
     do
     {
         T2Debug("%s while Loop -- START \n", __FUNCTION__);
