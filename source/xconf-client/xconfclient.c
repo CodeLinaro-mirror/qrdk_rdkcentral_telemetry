@@ -951,8 +951,6 @@ static int waitForNTPSyncDir(void)
     }
 }
 
-
-
 /**
  * @brief Wait for NTP time synchronization before proceeding with xconf fetch.
  *
@@ -966,7 +964,7 @@ static int waitForNTPSyncDir(void)
  *    - If the directory does not exist yet, wait up to NTP_SYNC_DIR_WAIT_TIMEOUT_SEC
  *      (30 minutes) for it to appear. If it never appears, systimemgr is likely
  *      absent on this platform → return false.
- *    - If inotify_init1 fails entirely, fall back to indefinite polling.
+ *    - If inotify_init1 fails, return false and proceed without NTP gate
  * 3. Once watching, wait indefinitely for NTP_SYNC_FILENAME creation.
  *
  * Interruptibility: select() with 2s timeout checks stopFetchRemoteConfiguration
@@ -1015,7 +1013,7 @@ static bool waitForNTPSync(void)
         wd = inotify_add_watch(ifd, NTP_SYNC_DIR, IN_CREATE | IN_MOVED_TO);
         if (wd < 0)
         {
-            T2Error("inotify_add_watch on %s still fails with errno=%d after dir appeared , proceeding without NTP sync\n",
+            T2Error("inotify_add_watch on %s still fails with errno=%d after dir appeared, proceeding without NTP sync\n",
                     NTP_SYNC_DIR, errno);
             close(ifd);
             return false;
