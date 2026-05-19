@@ -907,7 +907,7 @@ static int waitForNTPSyncDir(void)
     struct timespec deadline;
     if (clock_gettime(CLOCK_MONOTONIC, &deadline) != 0)
     {
-        T2Error("clock_gettime failed (errno=%d), cannot wait for NTP_SYNC_DIR\n", errno);
+        T2Error("clock_gettime failed with errno=%d, cannot wait for NTP_SYNC_DIR\n", errno);
         return -1;
     }
     deadline.tv_sec += NTP_SYNC_DIR_WAIT_TIMEOUT_SEC;
@@ -935,7 +935,7 @@ static int waitForNTPSyncDir(void)
         struct timespec now;
         if (clock_gettime(CLOCK_MONOTONIC, &now) != 0)
         {
-            T2Error("clock_gettime failed in dir wait (errno=%d), aborting\n", errno);
+            T2Error("clock_gettime failed in dir wait with errno=%d, aborting\n", errno);
             return -1;
         }
         if (now.tv_sec >= deadline.tv_sec)
@@ -989,7 +989,7 @@ static bool waitForNTPSync(void)
     int ifd = inotify_init1(IN_CLOEXEC);
     if (ifd < 0)
     {
-        T2Error("inotify_init1 failed (errno=%d), proceeding without NTP sync\n", errno);
+        T2Error("inotify_init1 failed with errno=%d, proceeding without NTP sync\n", errno);
         return false;
     }
 
@@ -1001,7 +1001,7 @@ static bool waitForNTPSync(void)
          * is created by systimemgr at startup). Wait up to 30 minutes for the
          * directory to appear.
          */
-        T2Warning("inotify_add_watch on %s failed (errno=%d), waiting for directory\n", NTP_SYNC_DIR, errno);
+        T2Warning("inotify_add_watch on %s failed with errno=%d, waiting for directory\n", NTP_SYNC_DIR, errno);
 
         int dirResult = waitForNTPSyncDir();
         if (dirResult < 0)
@@ -1015,7 +1015,7 @@ static bool waitForNTPSync(void)
         wd = inotify_add_watch(ifd, NTP_SYNC_DIR, IN_CREATE | IN_MOVED_TO);
         if (wd < 0)
         {
-            T2Error("inotify_add_watch on %s still fails after dir appeared (errno=%d), proceeding without NTP sync\n",
+            T2Error("inotify_add_watch on %s still fails with errno=%d after dir appeared , proceeding without NTP sync\n",
                     NTP_SYNC_DIR, errno);
             close(ifd);
             return false;
@@ -1064,7 +1064,7 @@ static bool waitForNTPSync(void)
             {
                 continue;
             }
-            T2Error("select() failed (errno=%d)\n", errno);
+            T2Error("select() failed with errno=%d\n", errno);
             break;
         }
         if (ret == 0)
