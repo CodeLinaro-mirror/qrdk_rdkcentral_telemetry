@@ -895,12 +895,9 @@ T2ERROR getRemoteConfigURL(char **configURL)
  * Called when inotify_add_watch fails because the watch directory does not yet
  * exist (e.g. /tmp/systimemgr is created by systimemgr at startup). Polls
  * every 2s, checking stopFetchRemoteConfiguration on each iteration.
- * If the NTP indicator file itself appears during this wait, returns true
- * immediately (NTP synced while we were waiting for the directory).
  *
- * @return true if NTP indicator detected, false if directory appeared (caller
- *         should proceed to inotify setup), or -1 on timeout/shutdown.
- *         Encoded: 1 = NTP synced, 0 = dir appeared, -1 = give up.
+ * @return 0 if directory appeared (caller should proceed to inotify setup),
+ *         -1 on timeout/shutdown (directory never appeared).
  */
 static int waitForNTPSyncDir(void)
 {
@@ -925,13 +922,6 @@ static int waitForNTPSyncDir(void)
         {
             T2Info("NTP dir wait interrupted by shutdown\n");
             return -1;
-        }
-
-        /* Check if the NTP indicator itself already appeared */
-        if (access(NTP_SYNC_INDICATOR, F_OK) == 0)
-        {
-            T2Info("NTP sync detected while waiting for directory: %s\n", NTP_SYNC_INDICATOR);
-            return 1;
         }
 
         /* Check if the directory now exists */
@@ -961,41 +951,7 @@ static int waitForNTPSyncDir(void)
     }
 }
 
-/**
- * @brief Polling fallback for waitForNTPSync() when inotify_init1 fails.
- *
- * Polls NTP_SYNC_INDICATOR indefinitely (only exits on shutdown or file
- * detection). Used when the kernel inotify subsystem is unavailable.
- *
- * @return true if NTP indicator detected, false on shutdown.
- */
-static bool pollForNTPSyncFallback(void)
-{
-    T2Warning("NTP sync fallback: polling %s every 2s indefinitely (inotify unavailable)\n", NTP_SYNC_INDICATOR);
 
-    for (;;)
-    {
-        pthread_mutex_lock(&xcThreadMutex);
-        bool shouldStop = stopFetchRemoteConfiguration;
-        pthread_mutex_unlock(&xcThreadMutex);
-
-        if (shouldStop)
-        {
-            T2Info("NTP sync wait (fallback) interrupted by shutdown\n");
-            return false;
-        }
-
-        if (access(NTP_SYNC_INDICATOR, F_OK) == 0)
-        {
-            T2Info("NTP sync detected via fallback poll: %s\n", NTP_SYNC_INDICATOR);
-            return true;
-        }
-
-        /* Interruptible 2s sleep */
-        struct timeval tv = {2, 0};
-        select(0, NULL, NULL, NULL, &tv);
-    }
-}
 
 /**
  * @brief Wait for NTP time synchronization before proceeding with xconf fetch.
@@ -1035,8 +991,8 @@ static bool waitForNTPSync(void)
     int ifd = inotify_init1(IN_CLOEXEC);
     if (ifd < 0)
     {
-        T2Error("inotify_init1 failed (errno=%d), falling back to indefinite polling\n", errno);
-        return pollForNTPSyncFallback();
+        T2Error("inotify_init1 failed (errno=%d), proceeding without NTP sync\n", errno);
+        return false;
     }
 
     int wd = inotify_add_watch(ifd, NTP_SYNC_DIR, IN_CREATE | IN_MOVED_TO);
@@ -1050,12 +1006,6 @@ static bool waitForNTPSync(void)
         T2Warning("inotify_add_watch on %s failed (errno=%d), waiting for directory\n", NTP_SYNC_DIR, errno);
 
         int dirResult = waitForNTPSyncDir();
-        if (dirResult == 1)
-        {
-            /* NTP indicator appeared while waiting for directory */
-            close(ifd);
-            return true;
-        }
         if (dirResult < 0)
         {
             /* Timeout or shutdown — directory never appeared */
@@ -1067,10 +1017,10 @@ static bool waitForNTPSync(void)
         wd = inotify_add_watch(ifd, NTP_SYNC_DIR, IN_CREATE | IN_MOVED_TO);
         if (wd < 0)
         {
-            T2Error("inotify_add_watch on %s still fails after dir appeared (errno=%d), falling back to indefinite polling\n",
+            T2Error("inotify_add_watch on %s still fails after dir appeared (errno=%d), proceeding without NTP sync\n",
                     NTP_SYNC_DIR, errno);
             close(ifd);
-            return pollForNTPSyncFallback();
+            return false;
         }
     }
 
