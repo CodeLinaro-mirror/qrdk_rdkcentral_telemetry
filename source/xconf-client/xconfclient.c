@@ -979,8 +979,6 @@ static int waitForNTPSyncDir(void)
  */
 static bool waitForNTPSync(void)
 {
-    T2Info("Waiting for NTP sync indicator: %s (indefinite wait)\n", NTP_SYNC_INDICATOR);
-
     /* Fast path: file already exists (e.g. daemon restart after NTP synced) */
     if (access(NTP_SYNC_INDICATOR, F_OK) == 0)
     {
@@ -1036,6 +1034,7 @@ static bool waitForNTPSync(void)
     bool result = false;
     char buf[sizeof(struct inotify_event) + NAME_MAX + 1];
 
+    T2Info("Waiting for NTP sync indicator: %s \n", NTP_SYNC_INDICATOR);
     /* Wait indefinitely — only exits on shutdown or file detection */
     while (!result)
     {
@@ -1049,7 +1048,7 @@ static bool waitForNTPSync(void)
             break;
         }
 
-        /* Use select() with 2s timeout for interruptibility */
+        /* select() with 2s timeout for interruptibility */
         struct timeval tv;
         tv.tv_sec = 2;
         tv.tv_usec = 0;
@@ -1079,7 +1078,7 @@ static bool waitForNTPSync(void)
             continue;
         }
 
-        /* Parse inotify events for our target filename */
+        /* Parse inotify events for NTP sync indicator */
         ssize_t offset = 0;
         while (offset < len)
         {
