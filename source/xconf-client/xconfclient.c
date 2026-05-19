@@ -82,12 +82,13 @@
  *   network reconnect (file is never removed, so re-triggering is not possible)
  * - Uses inotify for instant zero-CPU detection, with select() for
  *   interruptible shutdown
- * - Waits up to NTP_SYNC_WAIT_TIMEOUT_SEC for NTP sync; on timeout proceeds
- *   anyway, letting the existing xconf retry loop (MAX_XCONF_RETRY_COUNT x
- *   XCONF_RETRY_TIMEOUT) handle repeated fetch attempts. Total worst-case from
- *   boot: NTP_SYNC_WAIT_TIMEOUT_SEC + MAX_XCONF_RETRY_COUNT x XCONF_RETRY_TIMEOUT.
- * - CLOCK_MONOTONIC used for the deadline — CLOCK_REALTIME is not safe before
- *   NTP has synced.
+ * - Waits indefinitely for the NTP sync indicator once the directory exists.
+ *   If the directory (NTP_SYNC_DIR) does not exist at startup, polls for up to
+ *   NTP_SYNC_DIR_WAIT_TIMEOUT_SEC for it to appear (systimemgr creates it).
+ *   If the directory never appears, proceeds without NTP — systimemgr is likely
+ *   not installed on this platform.
+ * - CLOCK_MONOTONIC used for directory-wait deadline — CLOCK_REALTIME is not
+ *   safe before NTP has synced.
  */
 #if defined(ENABLE_RDKB_SUPPORT)
 #define NTP_SYNC_INDICATOR "/tmp/clock-event"
@@ -98,10 +99,10 @@
 #define NTP_SYNC_DIR "/tmp/systimemgr"
 #define NTP_SYNC_FILENAME "ntp"
 #endif
-/* Maximum time to wait for NTP sync before proceeding with xconf fetch anyway.
- * 30 minutes provides headroom beyond typical RDK boot (2-3 min on healthy
- * network). The xconf retry loop handles fetch failures if NTP is still absent. */
-#define NTP_SYNC_WAIT_TIMEOUT_SEC  1800
+/* Maximum time to wait for NTP_SYNC_DIR to appear when it does not exist yet.
+ * 3 minutes covers typical systimemgr startup lag. If the directory never
+ * appears, systimemgr is likely absent and we proceed without NTP gate. */
+#define NTP_SYNC_DIR_WAIT_TIMEOUT_SEC  1800
 #endif /* NTP_SYNC_INDICATION */
 #define XCONF_CONFIG_FILE  "DCMresponse.txt"
 #define PROCESS_CONFIG_COMPLETE_FLAG "/tmp/t2DcmComplete"
@@ -889,19 +890,88 @@ T2ERROR getRemoteConfigURL(char **configURL)
 
 #if defined(NTP_SYNC_INDICATION)
 /**
- * @brief Polling fallback for waitForNTPSync() when inotify is unavailable.
+ * @brief Wait for NTP_SYNC_DIR to appear (max NTP_SYNC_DIR_WAIT_TIMEOUT_SEC).
  *
- * Used when inotify_init1() or inotify_add_watch() fails (e.g., the watch
- * directory does not yet exist). Polls NTP_SYNC_INDICATOR every 2s, checking
- * stopFetchRemoteConfiguration and the shared monotonic deadline on each
- * iteration. Shutdown latency is at most 2s.
+ * Called when inotify_add_watch fails because the watch directory does not yet
+ * exist (e.g. /tmp/systimemgr is created by systimemgr at startup). Polls
+ * every 2s, checking stopFetchRemoteConfiguration on each iteration.
+ * If the NTP indicator file itself appears during this wait, returns true
+ * immediately (NTP synced while we were waiting for the directory).
  *
- * @param deadline  Absolute CLOCK_MONOTONIC time after which to give up.
- * @return true if indicator file detected, false on timeout or shutdown.
+ * @return true if NTP indicator detected, false if directory appeared (caller
+ *         should proceed to inotify setup), or -1 on timeout/shutdown.
+ *         Encoded: 1 = NTP synced, 0 = dir appeared, -1 = give up.
  */
-static bool pollForNTPSyncFallback(struct timespec deadline)
+static int waitForNTPSyncDir(void)
 {
-    T2Warning("NTP sync fallback: polling %s every 2s (inotify unavailable)\n", NTP_SYNC_INDICATOR);
+    T2Info("NTP_SYNC_DIR %s does not exist, polling up to %ds for it to appear\n",
+           NTP_SYNC_DIR, NTP_SYNC_DIR_WAIT_TIMEOUT_SEC);
+
+    struct timespec deadline;
+    if (clock_gettime(CLOCK_MONOTONIC, &deadline) != 0)
+    {
+        T2Error("clock_gettime failed (errno=%d), cannot wait for NTP_SYNC_DIR\n", errno);
+        return -1;
+    }
+    deadline.tv_sec += NTP_SYNC_DIR_WAIT_TIMEOUT_SEC;
+
+    for (;;)
+    {
+        pthread_mutex_lock(&xcThreadMutex);
+        bool shouldStop = stopFetchRemoteConfiguration;
+        pthread_mutex_unlock(&xcThreadMutex);
+
+        if (shouldStop)
+        {
+            T2Info("NTP dir wait interrupted by shutdown\n");
+            return -1;
+        }
+
+        /* Check if the NTP indicator itself already appeared */
+        if (access(NTP_SYNC_INDICATOR, F_OK) == 0)
+        {
+            T2Info("NTP sync detected while waiting for directory: %s\n", NTP_SYNC_INDICATOR);
+            return 1;
+        }
+
+        /* Check if the directory now exists */
+        if (access(NTP_SYNC_DIR, F_OK) == 0)
+        {
+            T2Info("NTP_SYNC_DIR %s appeared, proceeding to inotify watch\n", NTP_SYNC_DIR);
+            return 0;
+        }
+
+        /* Check deadline */
+        struct timespec now;
+        if (clock_gettime(CLOCK_MONOTONIC, &now) != 0)
+        {
+            T2Error("clock_gettime failed in dir wait (errno=%d), aborting\n", errno);
+            return -1;
+        }
+        if (now.tv_sec >= deadline.tv_sec)
+        {
+            T2Error("NTP_SYNC_DIR did not appear within %d seconds — systimemgr likely absent, proceeding without NTP sync\n",
+                    NTP_SYNC_DIR_WAIT_TIMEOUT_SEC);
+            return -1;
+        }
+
+        /* Interruptible 2s sleep */
+        struct timeval tv = {2, 0};
+        select(0, NULL, NULL, NULL, &tv);
+    }
+}
+
+/**
+ * @brief Polling fallback for waitForNTPSync() when inotify_init1 fails.
+ *
+ * Polls NTP_SYNC_INDICATOR indefinitely (only exits on shutdown or file
+ * detection). Used when the kernel inotify subsystem is unavailable.
+ *
+ * @return true if NTP indicator detected, false on shutdown.
+ */
+static bool pollForNTPSyncFallback(void)
+{
+    T2Warning("NTP sync fallback: polling %s every 2s indefinitely (inotify unavailable)\n", NTP_SYNC_INDICATOR);
 
     for (;;)
     {
@@ -915,26 +985,13 @@ static bool pollForNTPSyncFallback(struct timespec deadline)
             return false;
         }
 
-        struct timespec now;
-        if (clock_gettime(CLOCK_MONOTONIC, &now) != 0)
-        {
-            /* Cannot determine elapsed time; treat as timeout to avoid infinite block */
-            T2Error("clock_gettime failed in NTP fallback poll (errno=%d), aborting wait\n", errno);
-            return false;
-        }
-        if (now.tv_sec >= deadline.tv_sec)
-        {
-            T2Error("NTP sync wait timed out after %d seconds, proceeding without NTP sync\n", NTP_SYNC_WAIT_TIMEOUT_SEC);
-            return false;
-        }
-
         if (access(NTP_SYNC_INDICATOR, F_OK) == 0)
         {
             T2Info("NTP sync detected via fallback poll: %s\n", NTP_SYNC_INDICATOR);
             return true;
         }
 
-        /* Interruptible 2s sleep — mirrors the select() timeout in the inotify path */
+        /* Interruptible 2s sleep */
         struct timeval tv = {2, 0};
         select(0, NULL, NULL, NULL, &tv);
     }
@@ -943,24 +1000,30 @@ static bool pollForNTPSyncFallback(struct timespec deadline)
 /**
  * @brief Wait for NTP time synchronization before proceeding with xconf fetch.
  *
- * Blocks until the indicator file exists, indicating NTP has synced and
- * network + accurate system time are available (required for TLS).
+ * Blocks indefinitely until the NTP indicator file exists, indicating NTP has
+ * synced and network + accurate system time are available (required for TLS).
+ * Only exits on file detection or shutdown signal.
  *
- * Detection: inotify watch on the indicator directory for file creation (zero CPU while waiting).
- * Interruptibility: select() with 2s timeout checks stopFetchRemoteConfiguration and deadline.
- * Fallback: If inotify setup fails, delegates to pollForNTPSyncFallback().
- * Timeout: NTP_SYNC_WAIT_TIMEOUT_SEC (CLOCK_MONOTONIC). On expiry returns false
- *   and lets the existing xconf retry loop (MAX_XCONF_RETRY_COUNT x XCONF_RETRY_TIMEOUT)
- *   handle subsequent fetch attempts.
+ * Strategy:
+ * 1. Fast path: indicator file already exists → return immediately.
+ * 2. Set up inotify on NTP_SYNC_DIR.
+ *    - If the directory does not exist yet, wait up to NTP_SYNC_DIR_WAIT_TIMEOUT_SEC
+ *      (3 minutes) for it to appear. If it never appears, systimemgr is likely
+ *      absent on this platform → return false.
+ *    - If inotify_init1 fails entirely, fall back to indefinite polling.
+ * 3. Once watching, wait indefinitely for NTP_SYNC_FILENAME creation.
+ *
+ * Interruptibility: select() with 2s timeout checks stopFetchRemoteConfiguration
+ * on every iteration — max 2s shutdown latency.
  *
  * Called once at boot, outside the do-while restart loop — startXConfClient()
  * restarts skip this (NTP already synced by then).
  *
- * @return true if NTP sync detected, false on timeout/shutdown/error
+ * @return true if NTP sync detected, false on shutdown/error/dir-timeout
  */
 static bool waitForNTPSync(void)
 {
-    T2Info("Waiting for NTP sync indicator: %s (timeout %ds)\n", NTP_SYNC_INDICATOR, NTP_SYNC_WAIT_TIMEOUT_SEC);
+    T2Info("Waiting for NTP sync indicator: %s (indefinite wait)\n", NTP_SYNC_INDICATOR);
 
     /* Fast path: file already exists (e.g. daemon restart after NTP synced) */
     if (access(NTP_SYNC_INDICATOR, F_OK) == 0)
@@ -969,20 +1032,11 @@ static bool waitForNTPSync(void)
         return true;
     }
 
-    /* Compute a CLOCK_MONOTONIC deadline — safe to use before NTP sync */
-    struct timespec deadline;
-    if (clock_gettime(CLOCK_MONOTONIC, &deadline) != 0)
-    {
-        T2Error("clock_gettime failed (errno=%d), cannot gate on NTP sync\n", errno);
-        return false;
-    }
-    deadline.tv_sec += NTP_SYNC_WAIT_TIMEOUT_SEC;
-
     int ifd = inotify_init1(IN_CLOEXEC);
     if (ifd < 0)
     {
-        T2Error("inotify_init1 failed (errno=%d), falling back to polling\n", errno);
-        return pollForNTPSyncFallback(deadline);
+        T2Error("inotify_init1 failed (errno=%d), falling back to indefinite polling\n", errno);
+        return pollForNTPSyncFallback();
     }
 
     int wd = inotify_add_watch(ifd, NTP_SYNC_DIR, IN_CREATE | IN_MOVED_TO);
@@ -990,12 +1044,34 @@ static bool waitForNTPSync(void)
     {
         /*
          * Most likely cause: NTP_SYNC_DIR does not exist yet (e.g. /tmp/systimemgr
-         * is created by systimemgr at startup). Fall back to polling, which will
-         * detect the indicator file once the directory and file both appear.
+         * is created by systimemgr at startup). Wait up to 3 minutes for the
+         * directory to appear.
          */
-        T2Error("inotify_add_watch on %s failed (errno=%d), falling back to polling\n", NTP_SYNC_DIR, errno);
-        close(ifd);
-        return pollForNTPSyncFallback(deadline);
+        T2Warning("inotify_add_watch on %s failed (errno=%d), waiting for directory\n", NTP_SYNC_DIR, errno);
+
+        int dirResult = waitForNTPSyncDir();
+        if (dirResult == 1)
+        {
+            /* NTP indicator appeared while waiting for directory */
+            close(ifd);
+            return true;
+        }
+        if (dirResult < 0)
+        {
+            /* Timeout or shutdown — directory never appeared */
+            close(ifd);
+            return false;
+        }
+
+        /* Directory appeared — retry inotify_add_watch */
+        wd = inotify_add_watch(ifd, NTP_SYNC_DIR, IN_CREATE | IN_MOVED_TO);
+        if (wd < 0)
+        {
+            T2Error("inotify_add_watch on %s still fails after dir appeared (errno=%d), falling back to indefinite polling\n",
+                    NTP_SYNC_DIR, errno);
+            close(ifd);
+            return pollForNTPSyncFallback();
+        }
     }
 
     /* Re-check after watch is set to close the race window */
@@ -1010,6 +1086,7 @@ static bool waitForNTPSync(void)
     bool result = false;
     char buf[sizeof(struct inotify_event) + NAME_MAX + 1];
 
+    /* Wait indefinitely — only exits on shutdown or file detection */
     while (!result)
     {
         pthread_mutex_lock(&xcThreadMutex);
@@ -1019,19 +1096,6 @@ static bool waitForNTPSync(void)
         if (shouldStop)
         {
             T2Info("NTP wait interrupted by shutdown\n");
-            break;
-        }
-
-        struct timespec now;
-        if (clock_gettime(CLOCK_MONOTONIC, &now) != 0)
-        {
-            /* Cannot determine elapsed time; treat as timeout to avoid infinite block */
-            T2Error("clock_gettime failed in NTP wait loop (errno=%d), aborting wait\n", errno);
-            break;
-        }
-        if (now.tv_sec >= deadline.tv_sec)
-        {
-            T2Error("NTP sync wait timed out after %d seconds, proceeding without NTP sync\n", NTP_SYNC_WAIT_TIMEOUT_SEC);
             break;
         }
 
@@ -1056,7 +1120,7 @@ static bool waitForNTPSync(void)
         }
         if (ret == 0)
         {
-            continue;    /* timeout, loop back to check flags and deadline */
+            continue;    /* timeout, loop back to check shutdown flag */
         }
 
         ssize_t len = read(ifd, buf, sizeof(buf));
