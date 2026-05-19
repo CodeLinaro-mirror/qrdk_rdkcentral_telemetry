@@ -100,7 +100,7 @@
 #define NTP_SYNC_FILENAME "ntp"
 #endif
 /* Maximum time to wait for NTP_SYNC_DIR to appear when it does not exist yet.
- * 3 minutes covers typical systimemgr startup lag. If the directory never
+ * 30 minutes covers typical systimemgr startup lag. If the directory never
  * appears, systimemgr is likely absent and we proceed without NTP gate. */
 #define NTP_SYNC_DIR_WAIT_TIMEOUT_SEC  1800
 #endif /* NTP_SYNC_INDICATION */
@@ -1008,7 +1008,7 @@ static bool pollForNTPSyncFallback(void)
  * 1. Fast path: indicator file already exists → return immediately.
  * 2. Set up inotify on NTP_SYNC_DIR.
  *    - If the directory does not exist yet, wait up to NTP_SYNC_DIR_WAIT_TIMEOUT_SEC
- *      (3 minutes) for it to appear. If it never appears, systimemgr is likely
+ *      (30 minutes) for it to appear. If it never appears, systimemgr is likely
  *      absent on this platform → return false.
  *    - If inotify_init1 fails entirely, fall back to indefinite polling.
  * 3. Once watching, wait indefinitely for NTP_SYNC_FILENAME creation.
@@ -1044,7 +1044,7 @@ static bool waitForNTPSync(void)
     {
         /*
          * Most likely cause: NTP_SYNC_DIR does not exist yet (e.g. /tmp/systimemgr
-         * is created by systimemgr at startup). Wait up to 3 minutes for the
+         * is created by systimemgr at startup). Wait up to 30 minutes for the
          * directory to appear.
          */
         T2Warning("inotify_add_watch on %s failed (errno=%d), waiting for directory\n", NTP_SYNC_DIR, errno);
