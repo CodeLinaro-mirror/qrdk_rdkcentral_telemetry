@@ -568,13 +568,13 @@ reportXconfThreadEnd :
          * pthread_cond_wait can wake up spuriously without an actual signal. We must verify the actual
          * condition (timeout notification pending) before proceeding.
          *
-         * Wait while: profile exists AND no timeout pending AND not shutting down.
+         * Wait while: no report pending (profile NULL or reportInProgress=false) AND not shutting down.
          * Exit loop when: timeout arrives (reportInProgress=true) OR shutdown (initialized=false).
          *
          * pthread_cond_wait atomically releases plMutex while waiting.
          * When signaled or spuriously woken, it re-acquires plMutex before returning.
          */
-        while(singleProfile && !singleProfile->reportInProgress && initialized)
+        while(initialized && (singleProfile == NULL || !singleProfile->reportInProgress))
         {
             pthread_cond_wait(&reuseThread, &plMutex);
         }
